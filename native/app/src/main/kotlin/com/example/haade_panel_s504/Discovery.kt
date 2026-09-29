@@ -22,7 +22,7 @@ object Discovery {
         val origin = JSONObject()
             .put("name", context.getString(R.string.app_name))
             .put("sw_version", BuildConfig.VERSION_NAME)
-            .put("support_url", "https://github.com/Hotelk52339/haade_panel_s504")
+            .put("support_url", "https://github.com/haade-administrator/haade_panel_s504")
 
         fun entity(name: String, uniqueId: String) = JSONObject()
             .put("name", name)

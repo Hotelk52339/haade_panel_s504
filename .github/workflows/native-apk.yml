@@ -2,7 +2,11 @@ name: PanelLink APK
 
 on:
   push:
-    branches: [native-service]
+    branches: [main, native-service]
+    paths:
+      - 'native/**'
+      - '.github/workflows/native-apk.yml'
+  pull_request:
     paths:
       - 'native/**'
       - '.github/workflows/native-apk.yml'
