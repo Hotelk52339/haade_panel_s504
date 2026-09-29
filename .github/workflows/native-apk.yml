@@ -1,0 +1,58 @@
+name: PanelLink APK
+
+on:
+  push:
+    branches: [native-service]
+    paths:
+      - 'native/**'
+      - '.github/workflows/native-apk.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build release APK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+
+      - name: Signing key
+        env:
+          KEYSTORE_B64: ${{ secrets.PANEL_KEYSTORE_B64 }}
+        run: |
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/panel.p12"
+            echo "PANEL_KEYSTORE=$RUNNER_TEMP/panel.p12" >> "$GITHUB_ENV"
+          else
+            echo "::warning::No signing key configured, the APK is signed with a throwaway debug key"
+          fi
+
+      - name: Build
+        working-directory: native
+        env:
+          PANEL_KEYSTORE_PASSWORD: ${{ secrets.PANEL_KEYSTORE_PASSWORD }}
+          PANEL_KEY_ALIAS: ${{ secrets.PANEL_KEY_ALIAS }}
+          DEFAULT_HOST: ${{ vars.PANEL_DEFAULT_HOST }}
+          DEFAULT_USER: ${{ vars.PANEL_DEFAULT_USER }}
+        run: gradle --no-daemon --stacktrace assembleRelease "-PpanelDefaultHost=$DEFAULT_HOST" "-PpanelDefaultUser=$DEFAULT_USER"
+
+      - name: Collect APK
+        run: |
+          mkdir -p out
+          cp native/app/build/outputs/apk/release/*.apk out/panellink.apk
+          ls -l out/panellink.apk
+          sha256sum out/panellink.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: panellink-apk
+          path: out/panellink.apk
+          if-no-files-found: error

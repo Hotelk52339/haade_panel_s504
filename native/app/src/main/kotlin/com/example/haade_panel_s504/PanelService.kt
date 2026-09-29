@@ -1,0 +1,467 @@
+package com.example.haade_panel_s504
+
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.Service
+import android.content.Context
+import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.Network
+import android.os.Build
+import android.os.IBinder
+import android.os.SystemClock
+import android.util.Log
+import org.json.JSONException
+import org.json.JSONObject
+import java.util.Locale
+import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.TimeUnit
+import kotlin.math.abs
+import kotlin.math.max
+import kotlin.math.roundToInt
+
+/**
+ * The whole app: a foreground service that owns the MQTT connection and the panel hardware.
+ * It does not depend on any screen being open, starts on boot, and is restarted by Android
+ * (START_STICKY) or by [WatchdogJob] if it ever dies.
+ *
+ * All state lives on one worker thread, so hardware calls and MQTT handling never race.
+ */
+class PanelService : Service() {
+
+    companion object {
+        private const val TAG = "PanelService"
+        const val ACTION_RELOAD = "com.example.haade_panel_s504.action.RELOAD"
+        const val ACTION_TEST_LED = "com.example.haade_panel_s504.action.TEST_LED"
+        private const val CHANNEL_ID = "panel_service"
+        private const val NOTIFICATION_ID = 1
+
+        @Volatile var running = false
+            private set
+
+        fun start(context: Context, action: String? = null) {
+            val intent = Intent(context, PanelService::class.java).setAction(action)
+            try {
+                context.startForegroundService(intent)
+            } catch (e: Exception) {
+                Log.w(TAG, "cannot start service: $e")
+            }
+        }
+    }
+
+    private lateinit var prefs: Prefs
+    private val worker: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor { r -> Thread(r, "panel-worker") }
+
+    private var topics = Topics(Topics.DEFAULT_BASE)
+    private var deviceName = ""
+    private var mqtt: MqttLink? = null
+    private var ths: ThsReader? = null
+    private var light: LightMonitor? = null
+    private var inputTask: ScheduledFuture<*>? = null
+    private var republishTask: ScheduledFuture<*>? = null
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private var notificationText = ""
+    private var inputTriggersRelay = false
+
+    // LED as Home Assistant sees it: unscaled colour plus brightness.
+    private var ledOn = false
+    private var ledR = 255
+    private var ledG = 255
+    private var ledB = 255
+    private var ledBrightness = 255
+
+    private val relayOn = BooleanArray(3)
+    private val inputOn = arrayOfNulls<Boolean>(3)
+    private var temperature: Double? = null
+    private var humidity: Int? = null
+    private var lux: Double? = null
+    private var luxSentAt = 0L
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onCreate() {
+        super.onCreate()
+        running = true
+        prefs = Prefs(this)
+        createChannel()
+        startInForeground(getString(R.string.status_starting))
+        exec {
+            restoreHardware()
+            startFeatures()
+        }
+        registerNetworkCallback()
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        when (intent?.action) {
+            ACTION_RELOAD -> exec {
+                stopFeatures(publishOffline = true)
+                startFeatures()
+            }
+            ACTION_TEST_LED -> exec { testLed() }
+        }
+        return START_STICKY
+    }
+
+    override fun onDestroy() {
+        running = false
+        unregisterNetworkCallback()
+        exec { stopFeatures(publishOffline = true) }
+        worker.shutdown()
+        try {
+            worker.awaitTermination(8, TimeUnit.SECONDS)
+        } catch (_: InterruptedException) {
+        }
+        super.onDestroy()
+    }
+
+    // ---------------------------------------------------------------- features
+
+    private fun startFeatures() {
+        PanelStatus.resetConnection()
+        WatchdogJob.sync(this, prefs.watchdog)
+        topics = Topics(prefs.nodeId)
+        deviceName = prefs.deviceName
+        inputTriggersRelay = prefs.ioTriggersRelay
+        if (prefs.isConfigured) {
+            val cfg = MqttLink.Config(prefs.host, prefs.port, prefs.user, prefs.pass, prefs.tls, prefs.clientId, topics)
+            mqtt = MqttLink(cfg, linkListener(cfg.host)).also { it.start() }
+        } else {
+            setStatus(PanelStatus.Link.NOT_CONFIGURED, getString(R.string.status_not_configured))
+        }
+        if (prefs.thsEnabled) {
+            ths = ThsReader { kind, value -> exec { onClimate(kind, value) } }.also { it.start() }
+        } else {
+            temperature = null
+            humidity = null
+            PanelStatus.temperature = null
+            PanelStatus.humidity = null
+        }
+        if (prefs.ioEnabled) {
+            inputTask = worker.scheduleWithFixedDelay(Runnable { safely { pollInputs() } }, 0, 1, TimeUnit.SECONDS)
+        }
+        if (prefs.luxEnabled) {
+            val monitor = LightMonitor(this) { value -> exec { onLux(value) } }
+            if (monitor.start()) light = monitor else PanelStatus.lux = "—"
+        } else {
+            lux = null
+        }
+    }
+
+    private fun stopFeatures(publishOffline: Boolean) {
+        inputTask?.cancel(false)
+        inputTask = null
+        republishTask?.cancel(false)
+        republishTask = null
+        ths?.stop()
+        ths = null
+        light?.stop()
+        light = null
+        mqtt?.stop(publishOffline)
+        mqtt = null
+        inputOn.fill(null)
+    }
+
+    private fun linkListener(host: String) = object : MqttLink.Listener {
+        override fun onReady() = exec { publishEverything() }
+
+        override fun onMessage(topic: String, payload: String) = exec { handleMessage(topic, payload) }
+
+        override fun onState(state: MqttLink.State, detail: String) = when (state) {
+            MqttLink.State.CONNECTING -> setStatus(PanelStatus.Link.CONNECTING, getString(R.string.status_connecting, host))
+            MqttLink.State.CONNECTED -> setStatus(PanelStatus.Link.CONNECTED, getString(R.string.status_connected, host))
+            MqttLink.State.RETRY -> setStatus(PanelStatus.Link.RETRY, getString(R.string.status_retry, detail))
+        }
+    }
+
+    // ---------------------------------------------------------------- MQTT
+
+    /** Discovery, then availability, then every current state (after each connect and after an HA restart). */
+    private fun publishEverything() {
+        val link = mqtt ?: return
+        removeOldNodeId(link)
+        for ((topic, payload) in Discovery.configs(this, topics, deviceName)) link.publish(topic, payload, retain = true)
+        link.publish(topics.avail, "online", retain = true)
+        publishLed()
+        for (n in 1..2) link.publish(topics.relayState(n), onOff(relayOn[n]), retain = true)
+        for (n in 1..2) inputOn[n]?.let { link.publish(topics.inputState(n), onOff(it), retain = true) }
+        temperature?.let { publishTemperature(it) }
+        humidity?.let { publishHumidity(it) }
+        lux?.let { publishLux(it) }
+    }
+
+    /** After the node id was changed: empty retained configs make Home Assistant drop the old entities. */
+    private fun removeOldNodeId(link: MqttLink) {
+        val old = prefs.pendingCleanupNodeId
+        if (old.isEmpty()) return
+        if (old != topics.base) {
+            for (topic in Discovery.configTopics(old)) link.publish(topic, "", retain = true)
+            for (topic in Topics(old).retainedStates) link.publish(topic, "", retain = true)
+        }
+        prefs.pendingCleanupNodeId = ""
+    }
+
+    private fun handleMessage(topic: String, payload: String) {
+        when (topic) {
+            topics.ledSet -> handleLedCommand(payload)
+            topics.relaySet(1) -> setRelay(1, isOn(payload))
+            topics.relaySet(2) -> setRelay(2, isOn(payload))
+            Topics.HA_STATUS -> if (payload.trim().equals("online", ignoreCase = true)) {
+                // Home Assistant restarted: announce everything again after a short random pause.
+                republishTask?.cancel(false)
+                republishTask = worker.schedule(Runnable { safely { publishEverything() } }, (2L..6L).random(), TimeUnit.SECONDS)
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- LED
+
+    private fun handleLedCommand(payload: String) {
+        val text = payload.trim()
+        if (text.equals("ON", ignoreCase = true) || text.equals("OFF", ignoreCase = true)) {
+            ledOn = text.equals("ON", ignoreCase = true)
+        } else {
+            val json = try {
+                JSONObject(text)
+            } catch (e: JSONException) {
+                Log.w(TAG, "bad LED command: $text")
+                return
+            }
+            val state = json.optString("state", "")
+            ledOn = state.isEmpty() || !state.equals("OFF", ignoreCase = true)
+            if (json.has("brightness")) ledBrightness = json.optInt("brightness", ledBrightness).coerceIn(0, 255)
+            json.optJSONObject("color")?.let { c ->
+                ledR = c.optInt("r", ledR).coerceIn(0, 255)
+                ledG = c.optInt("g", ledG).coerceIn(0, 255)
+                ledB = c.optInt("b", ledB).coerceIn(0, 255)
+            }
+            if (ledOn && ledBrightness == 0) ledBrightness = 255
+        }
+        applyLed()
+        prefs.saveLed(ledOn, ledR, ledG, ledB, ledBrightness)
+        publishLed()
+    }
+
+    private fun applyLed() {
+        if (ledOn) {
+            Hardware.setLed(ledR * ledBrightness / 255, ledG * ledBrightness / 255, ledB * ledBrightness / 255)
+        } else {
+            Hardware.setLed(0, 0, 0)
+        }
+        PanelStatus.ledOn = ledOn
+        PanelStatus.ledColor = (ledR shl 16) or (ledG shl 8) or ledB
+        PanelStatus.hardwareError = Hardware.ledError ?: Hardware.gpioError
+    }
+
+    /** State echo with color_mode and the unscaled colour, so Home Assistant shows the real colour and brightness. */
+    private fun publishLed() {
+        val json = JSONObject()
+            .put("state", onOff(ledOn))
+            .put("brightness", ledBrightness)
+            .put("color_mode", "rgb")
+            .put("color", JSONObject().put("r", ledR).put("g", ledG).put("b", ledB))
+        mqtt?.publish(topics.ledState, json.toString(), retain = true)
+    }
+
+    private fun testLed() {
+        for (c in listOf(intArrayOf(255, 0, 0), intArrayOf(0, 255, 0), intArrayOf(0, 0, 255), intArrayOf(255, 255, 255))) {
+            Hardware.setLed(c[0], c[1], c[2])
+            try {
+                Thread.sleep(600)
+            } catch (_: InterruptedException) {
+                break
+            }
+        }
+        applyLed()
+    }
+
+    // ---------------------------------------------------------------- relays and inputs
+
+    private fun setRelay(n: Int, on: Boolean) {
+        Hardware.setRelay(n, on)
+        relayOn[n] = on
+        prefs.saveRelay(n, on)
+        publishRelayStatus()
+        mqtt?.publish(topics.relayState(n), onOff(on), retain = true)
+    }
+
+    private fun publishRelayStatus() {
+        PanelStatus.relay1 = relayOn[1]
+        PanelStatus.relay2 = relayOn[2]
+        PanelStatus.hardwareError = Hardware.ledError ?: Hardware.gpioError
+    }
+
+    private fun pollInputs() {
+        for (n in 1..2) {
+            val value = Hardware.readInput(n) ?: continue
+            val previous = inputOn[n]
+            if (previous == value) continue
+            inputOn[n] = value
+            mqtt?.publish(topics.inputState(n), onOff(value), retain = true)
+            // Original behaviour, now optional: a press on an input switches its relay on.
+            if (value && previous != null && inputTriggersRelay) setRelay(n, true)
+        }
+        PanelStatus.inputs = "IO1: ${inputOn[1]?.let { onOff(it) } ?: "?"}, IO2: ${inputOn[2]?.let { onOff(it) } ?: "?"}"
+    }
+
+    private fun restoreHardware() {
+        ledOn = prefs.ledOn
+        ledR = prefs.ledR
+        ledG = prefs.ledG
+        ledB = prefs.ledB
+        ledBrightness = prefs.ledBrightness
+        applyLed()
+        for (n in 1..2) {
+            relayOn[n] = prefs.relay(n)
+            Hardware.setRelay(n, relayOn[n])
+        }
+        publishRelayStatus()
+    }
+
+    // ---------------------------------------------------------------- sensors
+
+    private fun onClimate(kind: ThsReader.Kind, raw: Double) {
+        when (kind) {
+            ThsReader.Kind.TEMPERATURE -> {
+                if (raw < -40 || raw > 100) return
+                val value = Math.round(raw * 2) / 2.0 // 0.5 °C steps, as before
+                if (value != temperature) {
+                    temperature = value
+                    PanelStatus.temperature = value
+                    publishTemperature(value)
+                }
+            }
+            ThsReader.Kind.HUMIDITY -> {
+                if (raw < 0 || raw > 100) return
+                val value = raw.roundToInt()
+                if (value != humidity) {
+                    humidity = value
+                    PanelStatus.humidity = value
+                    publishHumidity(value)
+                }
+            }
+        }
+    }
+
+    private fun publishTemperature(value: Double) {
+        mqtt?.publish(topics.temperature, "{\"temperature\": " + String.format(Locale.US, "%.1f", value) + "}", retain = true)
+    }
+
+    private fun publishHumidity(value: Int) {
+        mqtt?.publish(topics.humidity, "{\"humidity\": $value}", retain = true)
+    }
+
+    private fun onLux(value: Double) {
+        val now = SystemClock.elapsedRealtime()
+        val last = lux
+        val significant = last == null || abs(value - last) >= max(5.0, last * 0.1)
+        if (!significant || now - luxSentAt < 5_000) return
+        lux = value
+        luxSentAt = now
+        publishLux(value)
+        PanelStatus.lux = String.format(Locale.US, "%.0f lx", value)
+    }
+
+    private fun publishLux(value: Double) {
+        mqtt?.publish(topics.lux, "{\"lux\": " + String.format(Locale.US, "%.1f", value) + "}", retain = true)
+    }
+
+    // ---------------------------------------------------------------- notification and status
+
+    @Synchronized
+    private fun setStatus(link: PanelStatus.Link, text: String) {
+        PanelStatus.link = link
+        PanelStatus.linkText = text
+        if (text == notificationText) return
+        notificationText = text
+        getSystemService(NotificationManager::class.java)?.notify(NOTIFICATION_ID, buildNotification(text))
+    }
+
+    private fun startInForeground(text: String) {
+        notificationText = text
+        val notification = buildNotification(text)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
+        } else {
+            startForeground(NOTIFICATION_ID, notification)
+        }
+    }
+
+    private fun buildNotification(text: String): Notification {
+        val open = PendingIntent.getActivity(
+            this, 0, Intent(this, SettingsActivity::class.java),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+        return Notification.Builder(this, CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_stat_panel)
+            .setContentTitle(getString(R.string.app_name))
+            .setContentText(text)
+            .setContentIntent(open)
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .setShowWhen(false)
+            .build()
+    }
+
+    private fun createChannel() {
+        val channel = NotificationChannel(CHANNEL_ID, getString(R.string.channel_name), NotificationManager.IMPORTANCE_MIN)
+        channel.setShowBadge(false)
+        getSystemService(NotificationManager::class.java)?.createNotificationChannel(channel)
+    }
+
+    // ---------------------------------------------------------------- network
+
+    private fun registerNetworkCallback() {
+        val cm = getSystemService(ConnectivityManager::class.java) ?: return
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                exec { mqtt?.kick() }
+            }
+        }
+        try {
+            cm.registerDefaultNetworkCallback(callback)
+            networkCallback = callback
+        } catch (e: Exception) {
+            Log.w(TAG, "network callback: $e")
+        }
+    }
+
+    private fun unregisterNetworkCallback() {
+        val callback = networkCallback ?: return
+        networkCallback = null
+        try {
+            getSystemService(ConnectivityManager::class.java)?.unregisterNetworkCallback(callback)
+        } catch (_: Exception) {
+        }
+    }
+
+    // ---------------------------------------------------------------- helpers
+
+    private fun exec(block: () -> Unit) {
+        try {
+            worker.execute { safely(block) }
+        } catch (_: RejectedExecutionException) {
+        }
+    }
+
+    private inline fun safely(block: () -> Unit) {
+        try {
+            block()
+        } catch (t: Throwable) {
+            Log.e(TAG, "worker", t)
+        }
+    }
+
+    private fun onOff(on: Boolean) = if (on) "ON" else "OFF"
+
+    private fun isOn(payload: String): Boolean {
+        val p = payload.trim()
+        return p.equals("ON", ignoreCase = true) || p == "1" || p.equals("true", ignoreCase = true)
+    }
+}
