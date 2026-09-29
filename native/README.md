@@ -10,7 +10,7 @@ unique_ids are the same, so existing Home Assistant entities and automations kee
 | Flutter app (1.2.1) | PanelLink (2.0.0) |
 |---|---|
 | MQTT lives only while the app screen is alive; *Back* or swiping it away stops everything | Foreground service, independent of any screen |
-| After one failed reconnect attempt (broker still restarting) it never reconnects, while Home Assistant may still show it online | Never gives up: backoff 1–30 s, supervisor check, instant retry when the network returns, re-subscribes after every connect |
+| Keep-alive never drops a dead connection (`disconnectOnNoResponsePeriod` is left at 0), so after a network or broker hiccup the app can stay "connected" to nothing; every retry posts a high-importance notification; only the first message of each `updates` batch is handled | Keep-alive 30 s drops a dead link, connect/subscribe deadlines, backoff 1–30 s, instant retry when the network returns, re-subscribes after every connect, one quiet notification |
 | After a reboot an empty service starts, the app has to be opened by hand | Starts on boot and after updates, optional watchdog |
 | `getevent -l` for **all** input devices (every touch included), one more process each time the screen is recreated | Reads only the two sensor devices with a blocking read — no CPU between measurements |
 | IO polled 2× per second through Flutter channels, light sensor raising a notification every second | IO and light sensor optional, one quiet service notification |
