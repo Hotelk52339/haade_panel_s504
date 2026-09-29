@@ -53,6 +53,11 @@
     <string name="btn_battery">Lever</string>
     <string name="battery_ok">Les restrictions sont déjà levées</string>
 
+    <string name="startup_hibernation">Suspension si inutilisée</string>
+    <string name="startup_hibernation_off">Désactivée — Android ne suspendra jamais l\'application</string>
+    <string name="startup_hibernation_on">Activée — Android peut arrêter l\'application après des mois sans ouverture. Touchez et désactivez « Suspendre l\'activité si inutilisée ».</string>
+    <string name="btn_open">Ouvrir</string>
+
     <string name="language_system">Système</string>
 
     <string name="tile_mqtt">MQTT</string>

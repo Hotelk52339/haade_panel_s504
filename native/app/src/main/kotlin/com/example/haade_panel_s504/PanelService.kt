@@ -90,7 +90,11 @@ class PanelService : Service() {
         running = true
         prefs = Prefs(this)
         createChannel()
-        startInForeground(getString(R.string.status_starting))
+        if (!startInForeground(getString(R.string.status_starting))) {
+            running = false
+            stopSelf()
+            return
+        }
         exec {
             restoreHardware()
             startFeatures()
@@ -210,8 +214,8 @@ class PanelService : Service() {
     private fun handleMessage(topic: String, payload: String) {
         when (topic) {
             topics.ledSet -> handleLedCommand(payload)
-            topics.relaySet(1) -> setRelay(1, isOn(payload))
-            topics.relaySet(2) -> setRelay(2, isOn(payload))
+            topics.relaySet(1) -> parseOnOff(payload)?.let { setRelay(1, it) }
+            topics.relaySet(2) -> parseOnOff(payload)?.let { setRelay(2, it) }
             Topics.HA_STATUS -> if (payload.trim().equals("online", ignoreCase = true)) {
                 // Home Assistant restarted: announce everything again after a short random pause.
                 republishTask?.cancel(false)
@@ -298,16 +302,20 @@ class PanelService : Service() {
     }
 
     private fun pollInputs() {
+        var changed = false
         for (n in 1..2) {
             val value = Hardware.readInput(n) ?: continue
             val previous = inputOn[n]
             if (previous == value) continue
             inputOn[n] = value
+            changed = true
             mqtt?.publish(topics.inputState(n), onOff(value), retain = true)
             // Original behaviour, now optional: a press on an input switches its relay on.
             if (value && previous != null && inputTriggersRelay) setRelay(n, true)
         }
-        PanelStatus.inputs = "IO1: ${inputOn[1]?.let { onOff(it) } ?: "?"}, IO2: ${inputOn[2]?.let { onOff(it) } ?: "?"}"
+        if (changed) {
+            PanelStatus.inputs = "IO1: ${inputOn[1]?.let { onOff(it) } ?: "?"}, IO2: ${inputOn[2]?.let { onOff(it) } ?: "?"}"
+        }
     }
 
     private fun restoreHardware() {
@@ -383,13 +391,20 @@ class PanelService : Service() {
         getSystemService(NotificationManager::class.java)?.notify(NOTIFICATION_ID, buildNotification(text))
     }
 
-    private fun startInForeground(text: String) {
+    /** false if Android refused (then the service stops instead of crash-looping). */
+    private fun startInForeground(text: String): Boolean {
         notificationText = text
         val notification = buildNotification(text)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
-        } else {
-            startForeground(NOTIFICATION_ID, notification)
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
+            } else {
+                startForeground(NOTIFICATION_ID, notification)
+            }
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "startForeground refused", e)
+            false
         }
     }
 
@@ -410,7 +425,7 @@ class PanelService : Service() {
     }
 
     private fun createChannel() {
-        val channel = NotificationChannel(CHANNEL_ID, getString(R.string.channel_name), NotificationManager.IMPORTANCE_MIN)
+        val channel = NotificationChannel(CHANNEL_ID, getString(R.string.channel_name), NotificationManager.IMPORTANCE_LOW)
         channel.setShowBadge(false)
         getSystemService(NotificationManager::class.java)?.createNotificationChannel(channel)
     }
@@ -460,8 +475,10 @@ class PanelService : Service() {
 
     private fun onOff(on: Boolean) = if (on) "ON" else "OFF"
 
-    private fun isOn(payload: String): Boolean {
-        val p = payload.trim()
-        return p.equals("ON", ignoreCase = true) || p == "1" || p.equals("true", ignoreCase = true)
+    /** Only an explicit ON/OFF switches a relay; anything else (empty, garbage) is ignored. */
+    private fun parseOnOff(payload: String): Boolean? = when (payload.trim().uppercase(Locale.ROOT)) {
+        "ON", "1", "TRUE" -> true
+        "OFF", "0", "FALSE" -> false
+        else -> null
     }
 }

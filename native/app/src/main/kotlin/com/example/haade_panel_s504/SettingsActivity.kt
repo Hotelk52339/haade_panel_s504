@@ -81,6 +81,8 @@ class SettingsActivity : Activity() {
     private lateinit var details: TextView
     private lateinit var batteryText: TextView
     private lateinit var batteryButton: Button
+    private var hibernationText: TextView? = null
+    private var hibernationButton: Button? = null
 
     private val handler = Handler(Looper.getMainLooper())
     private val ticker = object : Runnable {
@@ -245,8 +247,38 @@ class SettingsActivity : Activity() {
         batteryButton = secondaryButton(R.string.btn_battery) { requestBatteryExemption() }
         row.addView(batteryButton)
         card.addView(row)
+
+        // Android 11+ may "hibernate" apps that are not opened for months; that would also stop the boot start.
+        if (Build.VERSION.SDK_INT >= 30) {
+            val hib = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(0, dp(12), 0, dp(4))
+            }
+            val hibTexts = vertical()
+            hibTexts.addView(label(getString(R.string.startup_hibernation), 16f, C.TEXT))
+            hibernationText = label("", 12.5f, C.DIM).also { hibTexts.addView(it) }
+            hib.addView(hibTexts, LinearLayout.LayoutParams(0, WRAP, 1f).apply { marginEnd = dp(12) })
+            hibernationButton = secondaryButton(R.string.btn_open) { openHibernationSettings() }.also { hib.addView(it) }
+            card.addView(hib)
+        }
         return wrap(card)
     }
+
+    private fun openHibernationSettings() {
+        val pkg = Uri.parse("package:$packageName")
+        try {
+            startActivity(Intent(Intent.ACTION_AUTO_REVOKE_PERMISSIONS, pkg))
+        } catch (_: Exception) {
+            try {
+                startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, pkg))
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    private fun isHibernationExempt(): Boolean =
+        Build.VERSION.SDK_INT < 30 || packageManager.isAutoRevokeWhitelisted
 
     private fun languageCard(): View {
         val card = card(R.string.section_language)
@@ -381,6 +413,10 @@ class SettingsActivity : Activity() {
         val exempt = isBatteryExempt()
         batteryText.setText(if (exempt) R.string.startup_battery_off else R.string.startup_battery_on)
         batteryButton.visibility = if (exempt) View.GONE else View.VISIBLE
+
+        val hibernationOff = isHibernationExempt()
+        hibernationText?.setText(if (hibernationOff) R.string.startup_hibernation_off else R.string.startup_hibernation_on)
+        hibernationButton?.visibility = if (hibernationOff) View.GONE else View.VISIBLE
     }
 
     // ---------------------------------------------------------------- view helpers

@@ -9,6 +9,7 @@ import org.eclipse.paho.client.mqttv3.MqttCallbackExtended
 import org.eclipse.paho.client.mqttv3.MqttConnectOptions
 import org.eclipse.paho.client.mqttv3.MqttException
 import org.eclipse.paho.client.mqttv3.MqttMessage
+import org.eclipse.paho.client.mqttv3.ScheduledExecutorPingSender
 import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence
 import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
@@ -16,14 +17,20 @@ import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 import javax.net.ssl.SSLSocketFactory
+import kotlin.random.Random
 
 /**
  * One MQTT connection that never gives up.
  *
  * The original app retried from a timer that its own connect() cancelled, so one failed attempt
- * (broker still restarting) ended reconnection for good. Here every failure path schedules the
- * next attempt (1, 2, 4 … 30 s), a supervisor re-checks every minute, and after *every* connect
- * the command topics are subscribed again before the panel reports "online".
+ * (broker still restarting) ended reconnection for good. Here:
+ * - every failure path schedules the next attempt (1, 2, 4 … 30 s plus jitter);
+ * - connect and subscribe have deadlines (Paho's connectionTimeout covers only the TCP handshake,
+ *   a broker that accepts the socket but never sends CONNACK would otherwise hang it forever);
+ * - a supervisor re-checks every minute and a network callback triggers an immediate retry;
+ * - after *every* connect the command topics are subscribed again before the panel reports "online";
+ * - retained messages on command topics are ignored, so a stale retained "ON" can never switch
+ *   a relay on each reconnect.
  *
  * All connection bookkeeping runs on one control thread; [publish] may be called from any thread.
  */
@@ -54,12 +61,19 @@ class MqttLink(private val cfg: Config, private val listener: Listener) {
         Thread(r, "mqtt-ctl").apply { isDaemon = true }
     }
 
+    // Keep-alive pings on a monotonic scheduler (java.util.Timer would stall if the wall clock jumps back).
+    private val pinger: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor { r ->
+        Thread(r, "mqtt-ping").apply { isDaemon = true }
+    }
+
     private val subscriptions = arrayOf(cfg.topics.ledSet, cfg.topics.relaySet(1), cfg.topics.relaySet(2), Topics.HA_STATUS)
 
     @Volatile private var client: MqttAsyncClient? = null
     @Volatile private var stopped = false
     private var connecting = false
+    private var ready = false
     private var retry: ScheduledFuture<*>? = null
+    private var deadline: ScheduledFuture<*>? = null
     private var backoffSec = 1L
 
     fun start() {
@@ -102,6 +116,8 @@ class MqttLink(private val cfg: Config, private val listener: Listener) {
             ctl.submit(Runnable {
                 retry?.cancel(false)
                 retry = null
+                deadline?.cancel(false)
+                deadline = null
                 client?.let { c ->
                     client = null
                     shutdown(c, publishOffline)
@@ -115,13 +131,14 @@ class MqttLink(private val cfg: Config, private val listener: Listener) {
         } catch (_: Exception) {
         }
         ctl.shutdownNow()
+        pinger.shutdownNow()
     }
 
     private fun connectNow() {
         if (stopped || connecting || isConnected()) return
         retry = null
         val c = client ?: try {
-            MqttAsyncClient(cfg.uri, cfg.clientId, MemoryPersistence()).also { created ->
+            MqttAsyncClient(cfg.uri, cfg.clientId, MemoryPersistence(), ScheduledExecutorPingSender(pinger)).also { created ->
                 created.setCallback(callbackFor(created))
                 client = created
             }
@@ -131,7 +148,7 @@ class MqttLink(private val cfg: Config, private val listener: Listener) {
         }
         val options = MqttConnectOptions().apply {
             isCleanSession = true
-            keepAliveInterval = 30
+            keepAliveInterval = KEEP_ALIVE_SEC
             connectionTimeout = 10
             isAutomaticReconnect = false
             maxInflight = 64
@@ -141,19 +158,23 @@ class MqttLink(private val cfg: Config, private val listener: Listener) {
             if (cfg.tls) socketFactory = SSLSocketFactory.getDefault()
         }
         connecting = true
+        ready = false
         listener.onState(State.CONNECTING, "")
         try {
             c.connect(options, null, object : IMqttActionListener {
                 override fun onSuccess(token: IMqttToken?) = post {
+                    if (client !== c || !connecting) return@post
                     connecting = false
-                    if (client === c) subscribeAll(c)
+                    subscribeAll(c)
                 }
 
                 override fun onFailure(token: IMqttToken?, e: Throwable?) = post {
+                    if (client !== c) return@post
                     connecting = false
-                    if (client === c) restart(c, describe(e))
+                    restart(c, describe(e))
                 }
             })
+            armDeadline(c, CONNECT_DEADLINE_SEC, "broker did not answer the connection") { connecting }
         } catch (e: Exception) {
             connecting = false
             restart(c, describe(e))
@@ -165,11 +186,14 @@ class MqttLink(private val cfg: Config, private val listener: Listener) {
         try {
             c.subscribe(subscriptions, IntArray(subscriptions.size) { 1 }, null, object : IMqttActionListener {
                 override fun onSuccess(token: IMqttToken?) = post {
-                    if (stopped || client !== c) return@post
+                    if (stopped || client !== c || ready) return@post
                     if (token?.grantedQos?.any { it == 0x80 } == true) {
                         restart(c, "subscription rejected by broker")
                         return@post
                     }
+                    ready = true
+                    deadline?.cancel(false)
+                    deadline = null
                     backoffSec = 1
                     listener.onState(State.CONNECTED, "")
                     listener.onReady()
@@ -179,8 +203,21 @@ class MqttLink(private val cfg: Config, private val listener: Listener) {
                     if (client === c) restart(c, "subscribe: " + describe(e))
                 }
             })
+            armDeadline(c, SUBSCRIBE_DEADLINE_SEC, "broker did not confirm the subscription") { !ready }
         } catch (e: Exception) {
             restart(c, "subscribe: " + describe(e))
+        }
+    }
+
+    /** If [stillWaiting] is true after [seconds], this attempt is dead: drop the client and retry. */
+    private fun armDeadline(c: MqttAsyncClient, seconds: Long, reason: String, stillWaiting: () -> Boolean) {
+        deadline?.cancel(false)
+        deadline = try {
+            ctl.schedule(Runnable {
+                if (!stopped && client === c && stillWaiting()) restart(c, reason)
+            }, seconds, TimeUnit.SECONDS)
+        } catch (e: RejectedExecutionException) {
+            null
         }
     }
 
@@ -192,6 +229,8 @@ class MqttLink(private val cfg: Config, private val listener: Listener) {
         }
 
         override fun messageArrived(topic: String, message: MqttMessage) {
+            // A retained command is old news (and would re-fire on every reconnect).
+            if (message.isRetained && topic != Topics.HA_STATUS) return
             listener.onMessage(topic, String(message.payload, Charsets.UTF_8))
         }
 
@@ -202,16 +241,20 @@ class MqttLink(private val cfg: Config, private val listener: Listener) {
     private fun restart(c: MqttAsyncClient, reason: String) {
         if (client === c) client = null
         connecting = false
+        ready = false
+        deadline?.cancel(false)
+        deadline = null
         shutdown(c, publishOffline = false)
         scheduleRetry(reason)
     }
 
     private fun scheduleRetry(reason: String) {
         if (stopped) return
-        Log.i(TAG, "retry in ${backoffSec}s: $reason")
+        Log.i(TAG, "retry in ~${backoffSec}s: $reason")
         listener.onState(State.RETRY, reason)
         retry?.cancel(false)
-        val delay = backoffSec
+        // Up to +25 % jitter so several panels do not hammer a restarting broker in lockstep.
+        val delayMs = backoffSec * 1000 + Random.nextLong(backoffSec * 250 + 1)
         backoffSec = (backoffSec * 2).coerceAtMost(MAX_BACKOFF_SEC)
         retry = try {
             ctl.schedule(Runnable {
@@ -221,7 +264,7 @@ class MqttLink(private val cfg: Config, private val listener: Listener) {
                 } catch (t: Throwable) {
                     Log.e(TAG, "connect", t)
                 }
-            }, delay, TimeUnit.SECONDS)
+            }, delayMs, TimeUnit.MILLISECONDS)
         } catch (e: RejectedExecutionException) {
             null
         }
@@ -261,6 +304,9 @@ class MqttLink(private val cfg: Config, private val listener: Listener) {
 
     companion object {
         private const val TAG = "PanelMqtt"
+        private const val KEEP_ALIVE_SEC = 30
+        private const val CONNECT_DEADLINE_SEC = 25L
+        private const val SUBSCRIBE_DEADLINE_SEC = 20L
         private const val MAX_BACKOFF_SEC = 30L
         private val OFFLINE = "offline".toByteArray()
 

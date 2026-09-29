@@ -53,6 +53,11 @@
     <string name="btn_battery">Снять</string>
     <string name="battery_ok">Ограничения фона уже сняты</string>
 
+    <string name="startup_hibernation">Приостановка неиспользуемых</string>
+    <string name="startup_hibernation_off">Отключена — Android не остановит приложение</string>
+    <string name="startup_hibernation_on">Включена — через несколько месяцев без открытия Android может остановить приложение. Нажмите и выключите «Приостанавливать работу, если не используется».</string>
+    <string name="btn_open">Открыть</string>
+
     <string name="language_system">Системный</string>
 
     <string name="tile_mqtt">MQTT</string>

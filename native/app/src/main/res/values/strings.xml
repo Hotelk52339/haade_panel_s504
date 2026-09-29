@@ -53,6 +53,11 @@
     <string name="btn_battery">Lift</string>
     <string name="battery_ok">Background limits are already off</string>
 
+    <string name="startup_hibernation">Pause when unused</string>
+    <string name="startup_hibernation_off">Off — Android will never pause the app</string>
+    <string name="startup_hibernation_on">On — Android may stop the app after months without opening it. Tap and switch off “Pause app activity if unused”.</string>
+    <string name="btn_open">Open</string>
+
     <string name="language_system">System</string>
 
     <string name="tile_mqtt">MQTT</string>

@@ -28,6 +28,7 @@ object Discovery {
             .put("name", name)
             .put("unique_id", uniqueId)
             .put("availability_topic", topics.avail)
+            .put("qos", 1)
             .put("device", device)
             .put("origin", origin)
 
@@ -39,6 +40,9 @@ object Discovery {
             .put("brightness", true)
             .put("brightness_scale", 255)
             .put("supported_color_modes", JSONArray().put("rgb"))
+            // The driver has neither flash nor fades: do not let Home Assistant offer them.
+            .put("flash", false)
+            .put("transition", false)
         for (n in 1..2) {
             list += configTopic("switch", "${id}_relay$n") to entity(context.getString(R.string.entity_relay, n), "${id}_relay_$n")
                 .put("state_topic", topics.relayState(n))
