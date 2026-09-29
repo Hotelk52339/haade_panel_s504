@@ -41,6 +41,7 @@ class PanelService : Service() {
         const val ACTION_TEST_LED = "com.example.haade_panel_s504.action.TEST_LED"
         private const val CHANNEL_ID = "panel_service"
         private const val NOTIFICATION_ID = 1
+        private const val LUX_MIN_INTERVAL_MS = 5_000L
 
         @Volatile var running = false
             private set
@@ -82,6 +83,8 @@ class PanelService : Service() {
     private var humidity: Int? = null
     private var lux: Double? = null
     private var luxSentAt = 0L
+    private var luxPending: Double? = null
+    private var luxTask: ScheduledFuture<*>? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -163,6 +166,9 @@ class PanelService : Service() {
         inputTask = null
         republishTask?.cancel(false)
         republishTask = null
+        luxTask?.cancel(false)
+        luxTask = null
+        luxPending = null
         ths?.stop()
         ths = null
         light?.stop()
@@ -177,10 +183,10 @@ class PanelService : Service() {
 
         override fun onMessage(topic: String, payload: String) = exec { handleMessage(topic, payload) }
 
-        override fun onState(state: MqttLink.State, detail: String) = when (state) {
+        override fun onState(state: MqttLink.State, problem: MqttLink.Problem?) = when (state) {
             MqttLink.State.CONNECTING -> setStatus(PanelStatus.Link.CONNECTING, getString(R.string.status_connecting, host))
             MqttLink.State.CONNECTED -> setStatus(PanelStatus.Link.CONNECTED, getString(R.string.status_connected, host))
-            MqttLink.State.RETRY -> setStatus(PanelStatus.Link.RETRY, getString(R.string.status_retry, detail))
+            MqttLink.State.RETRY -> setStatus(PanelStatus.Link.RETRY, getString(R.string.status_retry, describe(problem)))
         }
     }
 
@@ -203,7 +209,8 @@ class PanelService : Service() {
     /** After the node id was changed: empty retained configs make Home Assistant drop the old entities. */
     private fun removeOldNodeId(link: MqttLink) {
         val old = prefs.pendingCleanupNodeId
-        if (old.isEmpty()) return
+        // Only once the service really runs with the new id, and only while the broker is reachable.
+        if (old.isEmpty() || topics.base != prefs.nodeId || !link.isConnected()) return
         if (old != topics.base) {
             for (topic in Discovery.configTopics(old)) link.publish(topic, "", retain = true)
             for (topic in Topics(old).retainedStates) link.publish(topic, "", retain = true)
@@ -227,6 +234,7 @@ class PanelService : Service() {
     // ---------------------------------------------------------------- LED
 
     private fun handleLedCommand(payload: String) {
+        val before = intArrayOf(if (ledOn) 1 else 0, ledR, ledG, ledB, ledBrightness)
         val text = payload.trim()
         if (text.equals("ON", ignoreCase = true) || text.equals("OFF", ignoreCase = true)) {
             ledOn = text.equals("ON", ignoreCase = true)
@@ -247,17 +255,32 @@ class PanelService : Service() {
             }
             if (ledOn && ledBrightness == 0) ledBrightness = 255
         }
-        applyLed()
+        if (!applyLed()) {
+            // The driver refused: keep and report the previous state, so Home Assistant does not show a lie.
+            ledOn = before[0] == 1
+            ledR = before[1]
+            ledG = before[2]
+            ledB = before[3]
+            ledBrightness = before[4]
+            updateLedStatus()
+            publishLed()
+            return
+        }
         prefs.saveLed(ledOn, ledR, ledG, ledB, ledBrightness)
         publishLed()
     }
 
-    private fun applyLed() {
-        if (ledOn) {
+    private fun applyLed(): Boolean {
+        val ok = if (ledOn) {
             Hardware.setLed(ledR * ledBrightness / 255, ledG * ledBrightness / 255, ledB * ledBrightness / 255)
         } else {
             Hardware.setLed(0, 0, 0)
         }
+        updateLedStatus()
+        return ok
+    }
+
+    private fun updateLedStatus() {
         PanelStatus.ledOn = ledOn
         PanelStatus.ledColor = (ledR shl 16) or (ledG shl 8) or ledB
         PanelStatus.hardwareError = Hardware.ledError ?: Hardware.gpioError
@@ -288,11 +311,10 @@ class PanelService : Service() {
     // ---------------------------------------------------------------- relays and inputs
 
     private fun setRelay(n: Int, on: Boolean) {
-        Hardware.setRelay(n, on)
-        relayOn[n] = on
-        prefs.saveRelay(n, on)
+        // If the GPIO driver fails the relay keeps its state, and that (unchanged) state is echoed back.
+        if (Hardware.setRelay(n, on)) relayOn[n] = on
         publishRelayStatus()
-        mqtt?.publish(topics.relayState(n), onOff(on), retain = true)
+        mqtt?.publish(topics.relayState(n), onOff(relayOn[n]), retain = true)
     }
 
     private fun publishRelayStatus() {
@@ -325,9 +347,10 @@ class PanelService : Service() {
         ledB = prefs.ledB
         ledBrightness = prefs.ledBrightness
         applyLed()
+        // Relays always start switched off (as in the original app): a pulse load must never come back on by itself.
         for (n in 1..2) {
-            relayOn[n] = prefs.relay(n)
-            Hardware.setRelay(n, relayOn[n])
+            Hardware.setRelay(n, false)
+            relayOn[n] = false
         }
         publishRelayStatus()
     }
@@ -366,12 +389,33 @@ class PanelService : Service() {
     }
 
     private fun onLux(value: Double) {
-        val now = SystemClock.elapsedRealtime()
         val last = lux
         val significant = last == null || abs(value - last) >= max(5.0, last * 0.1)
-        if (!significant || now - luxSentAt < 5_000) return
+        if (!significant) {
+            luxPending = null
+            return
+        }
+        val wait = luxSentAt + LUX_MIN_INTERVAL_MS - SystemClock.elapsedRealtime()
+        if (wait <= 0) {
+            sendLux(value)
+            return
+        }
+        // Too soon: remember the newest value and send it when the interval is over.
+        luxPending = value
+        if (luxTask == null) {
+            luxTask = worker.schedule(Runnable {
+                safely {
+                    luxTask = null
+                    luxPending?.let { sendLux(it) }
+                }
+            }, wait, TimeUnit.MILLISECONDS)
+        }
+    }
+
+    private fun sendLux(value: Double) {
+        luxPending = null
         lux = value
-        luxSentAt = now
+        luxSentAt = SystemClock.elapsedRealtime()
         publishLux(value)
         PanelStatus.lux = String.format(Locale.US, "%.0f lx", value)
     }
@@ -471,6 +515,19 @@ class PanelService : Service() {
         } catch (t: Throwable) {
             Log.e(TAG, "worker", t)
         }
+    }
+
+    private fun describe(problem: MqttLink.Problem?): String {
+        if (problem == null) return getString(R.string.reason_lost)
+        val text = when (problem.reason) {
+            MqttLink.Reason.AUTH -> getString(R.string.reason_auth)
+            MqttLink.Reason.UNREACHABLE -> getString(R.string.reason_unreachable)
+            MqttLink.Reason.NO_ANSWER -> getString(R.string.reason_no_answer)
+            MqttLink.Reason.REJECTED -> getString(R.string.reason_rejected)
+            MqttLink.Reason.LOST -> getString(R.string.reason_lost)
+            MqttLink.Reason.OTHER -> return problem.detail.ifEmpty { getString(R.string.reason_lost) }
+        }
+        return if (problem.detail.isNotEmpty() && problem.reason == MqttLink.Reason.UNREACHABLE) "$text (${problem.detail})" else text
     }
 
     private fun onOff(on: Boolean) = if (on) "ON" else "OFF"

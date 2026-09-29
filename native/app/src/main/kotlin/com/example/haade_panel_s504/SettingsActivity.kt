@@ -133,11 +133,11 @@ class SettingsActivity : Activity() {
         ) {
             requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
         }
-        PanelService.start(this)
     }
 
     override fun onResume() {
         super.onResume()
+        PanelService.start(this)
         handler.post(ticker)
     }
 
@@ -214,7 +214,10 @@ class SettingsActivity : Activity() {
 
     private fun deviceCard(): View {
         val card = card(R.string.section_device)
-        deviceName = field(card, R.string.label_device_name, prefs.deviceName, InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES)
+        deviceName = field(
+            card, R.string.label_device_name, prefs.deviceNameRaw,
+            InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES, getString(R.string.device_name_default),
+        )
         card.addView(note(R.string.device_name_desc))
         nodeId = field(card, R.string.label_node_id, prefs.nodeId, InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS, Topics.DEFAULT_BASE)
         card.addView(note(R.string.node_id_desc))
@@ -227,6 +230,8 @@ class SettingsActivity : Activity() {
         inputs = switchRow(card, R.string.feature_io, R.string.feature_io_desc, prefs.ioEnabled)
         inputRelay = switchRow(card, R.string.feature_io_relay, R.string.feature_io_relay_desc, prefs.ioTriggersRelay)
         lux = switchRow(card, R.string.feature_lux, R.string.feature_lux_desc, prefs.luxEnabled)
+        inputRelay.isEnabled = inputs.isChecked
+        inputs.setOnCheckedChangeListener { _, checked -> inputRelay.isEnabled = checked }
         return wrap(card)
     }
 
@@ -325,12 +330,28 @@ class SettingsActivity : Activity() {
     // ---------------------------------------------------------------- behaviour
 
     private fun save() {
+        var hostText = host.text.toString().trim()
+        val scheme = hostText.substringBefore("://", "").lowercase(Locale.ROOT)
+        if (scheme == "ssl" || scheme == "mqtts") tls.isChecked = true
+        hostText = hostText.substringAfter("://").trimEnd('/')
+        if (hostText.count { it == ':' } == 1) {
+            val embeddedPort = hostText.substringAfter(':').toIntOrNull()
+            if (embeddedPort != null) {
+                port.setText(embeddedPort.toString())
+                hostText = hostText.substringBefore(':')
+            }
+        }
+        if (hostText.any { it.isWhitespace() || it == '/' || it == '@' }) {
+            toast(R.string.bad_host)
+            return
+        }
+        host.setText(hostText)
         val portNumber = port.text.toString().trim().toIntOrNull()
         if (portNumber == null || portNumber !in 1..65535) {
             toast(R.string.bad_port)
             return
         }
-        prefs.host = host.text.toString().trim()
+        prefs.host = hostText
         prefs.port = portNumber
         prefs.user = user.text.toString().trim()
         prefs.pass = pass.text.toString()
@@ -343,7 +364,7 @@ class SettingsActivity : Activity() {
             prefs.nodeId = newId
         }
         nodeId.setText(newId)
-        prefs.deviceName = deviceName.text.toString().trim()
+        prefs.deviceNameRaw = deviceName.text.toString()
 
         prefs.thsEnabled = ths.isChecked
         prefs.ioEnabled = inputs.isChecked
@@ -499,7 +520,7 @@ class SettingsActivity : Activity() {
             )
         }
         row.addView(sw)
-        row.setOnClickListener { sw.toggle() }
+        row.setOnClickListener { if (sw.isEnabled) sw.toggle() }
         parent.addView(row)
         return sw
     }

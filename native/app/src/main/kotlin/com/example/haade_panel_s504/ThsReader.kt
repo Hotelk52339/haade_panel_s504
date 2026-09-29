@@ -22,15 +22,17 @@ import java.util.concurrent.TimeUnit
  */
 class ThsReader(private val onValue: (Kind, Double) -> Unit) {
 
-    enum class Kind { TEMPERATURE, HUMIDITY }
+    /** [code] is the EV_ABS axis each device reports on — the same ones the original app parsed. */
+    enum class Kind(val code: Int) { TEMPERATURE(0x06), HUMIDITY(0x1d) }
 
     @Volatile private var running = false
     private val closers = CopyOnWriteArrayList<Closeable>()
+    private val state = java.util.concurrent.ConcurrentHashMap<Kind, String>()
 
     fun start() {
         running = true
         val nodes = findNodes()
-        PanelStatus.sensorSource = nodes.entries.joinToString(", ") { "${it.key.name.lowercase()}: ${it.value}" }
+        for ((kind, path) in nodes) note(kind, path)
         for ((kind, path) in nodes) {
             Thread({ loop(kind, path) }, "ths-" + kind.name.lowercase()).apply {
                 isDaemon = true
@@ -53,7 +55,10 @@ class ThsReader(private val onValue: (Kind, Double) -> Unit) {
     private fun loop(kind: Kind, path: String) {
         readCurrent(kind, path)
         var viaGetevent = false
+        var pauseSec = 15L
         while (running) {
+            val started = System.nanoTime()
+            note(kind, if (viaGetevent) "$path (getevent)" else path)
             try {
                 if (viaGetevent) readViaGetevent(kind, path) else readEvents(kind, path)
             } catch (e: FileNotFoundException) {
@@ -62,17 +67,25 @@ class ThsReader(private val onValue: (Kind, Double) -> Unit) {
                     viaGetevent = true
                     continue
                 }
-                Log.w(TAG, "$path: ${e.message}")
+                note(kind, "$path — ${e.message}")
             } catch (e: Exception) {
-                if (running) Log.w(TAG, "$path: ${e.message}")
+                if (running) note(kind, "$path — ${e.message}")
             }
             if (!running) break
+            // A reader that ran for a while was healthy: start the pauses from the beginning again.
+            if (System.nanoTime() - started > TimeUnit.MINUTES.toNanos(5)) pauseSec = 15
             try {
-                TimeUnit.SECONDS.sleep(15)
+                TimeUnit.SECONDS.sleep(pauseSec)
             } catch (_: InterruptedException) {
                 return
             }
+            pauseSec = (pauseSec * 2).coerceAtMost(300)
         }
+    }
+
+    private fun note(kind: Kind, text: String) {
+        state[kind] = text
+        PanelStatus.sensorSource = Kind.values().mapNotNull { k -> state[k]?.let { "${k.name.lowercase()}: $it" } }.joinToString("\n")
     }
 
     /** Blocking read of raw `struct input_event` records. */
@@ -90,7 +103,8 @@ class ThsReader(private val onValue: (Kind, Double) -> Unit) {
                     var off = 0
                     while (off + size <= n) {
                         val type = bb.getShort(off + size - 8).toInt() and 0xffff
-                        if (type == EV_ABS) onValue(kind, bb.getInt(off + size - 4) / 100.0)
+                        val code = bb.getShort(off + size - 6).toInt() and 0xffff
+                        if (type == EV_ABS && code == kind.code) onValue(kind, bb.getInt(off + size - 4) / 100.0)
                         off += size
                     }
                 }
@@ -111,7 +125,7 @@ class ThsReader(private val onValue: (Kind, Double) -> Unit) {
                 while (running) {
                     val line = reader.readLine() ?: break
                     val t = line.trim().split(WHITESPACE)
-                    if (t.size >= 3 && t[t.size - 3] == "0003") {
+                    if (t.size >= 3 && t[t.size - 3] == "0003" && t[t.size - 2].toIntOrNull(16) == kind.code) {
                         val raw = t[t.size - 1].toLongOrNull(16) ?: continue
                         onValue(kind, raw.toInt() / 100.0)
                     }
@@ -132,7 +146,9 @@ class ThsReader(private val onValue: (Kind, Double) -> Unit) {
                 return
             }
             val text = proc.inputStream.bufferedReader().use { it.readText() }
-            val value = VALUE.find(text)?.groupValues?.get(1)?.toIntOrNull() ?: return
+            // "    ABS (0003): 0006  : value 2987, min …" — take the line of this sensor's axis.
+            val axis = Regex("%04x".format(kind.code) + "\\s*:\\s*value\\s+(-?\\d+)")
+            val value = axis.find(text)?.groupValues?.get(1)?.toIntOrNull() ?: return
             if (value != 0) onValue(kind, value / 100.0)
         } catch (e: Exception) {
             Log.w(TAG, "getevent -p $path: ${e.message}")
@@ -170,6 +186,5 @@ class ThsReader(private val onValue: (Kind, Double) -> Unit) {
         const val TAG = "PanelThs"
         const val EV_ABS = 3
         val WHITESPACE = Regex("\\s+")
-        val VALUE = Regex(":\\s*value\\s+(-?\\d+)")
     }
 }

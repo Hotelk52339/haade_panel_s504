@@ -28,7 +28,7 @@
     <string name="tls">Encrypted connection (TLS)</string>
     <string name="tls_desc">Only if the broker listens on ssl://</string>
     <string name="label_node_id">MQTT ID</string>
-    <string name="node_id_desc">Must be unique per panel. Change it only for another panel: a new ID creates new entities in Home Assistant.</string>
+    <string name="node_id_desc">Unique per panel. Change it only for another panel: the entities of the old ID are removed from Home Assistant and automations using them stop working.</string>
     <string name="battery_state">Background limits</string>
     <string name="label_device_name">Device name</string>
     <string name="device_name_desc">How the panel appears in Home Assistant. Entity IDs do not change.</string>
@@ -39,14 +39,14 @@
     <string name="feature_io">IO1 / IO2 inputs</string>
     <string name="feature_io_desc">Checks the terminals once per second</string>
     <string name="feature_io_relay">Input press switches its relay on</string>
-    <string name="feature_io_relay_desc">IO1 → relay 1, IO2 → relay 2</string>
+    <string name="feature_io_relay_desc">IO1 → relay 1, IO2 → relay 2 (needs the inputs on)</string>
     <string name="feature_lux">Light sensor</string>
     <string name="feature_lux_desc">Only if the panel has one</string>
 
     <string name="startup_autostart">Start after reboot</string>
     <string name="startup_autostart_desc">The service starts by itself when the panel boots</string>
     <string name="startup_watchdog">Restart if stopped</string>
-    <string name="startup_watchdog_desc">Checks every 15 minutes that the service is alive</string>
+    <string name="startup_watchdog_desc">Checks every 15 minutes that the service is alive (works when background limits are lifted)</string>
     <string name="startup_battery">Background limits</string>
     <string name="startup_battery_off">Off — Android will not throttle the service</string>
     <string name="startup_battery_on">On — tap to lift them</string>
@@ -85,4 +85,11 @@
     <string name="entity_temperature">Temperature</string>
     <string name="entity_humidity">Humidity</string>
     <string name="entity_lux">Illuminance</string>
+
+    <string name="reason_auth">wrong login or password</string>
+    <string name="reason_unreachable">broker unreachable</string>
+    <string name="reason_no_answer">broker does not answer</string>
+    <string name="reason_rejected">broker refused the subscription</string>
+    <string name="reason_lost">connection lost</string>
+    <string name="bad_host">Enter only the broker address, e.g. 192.168.1.10</string>
 </resources>

@@ -50,11 +50,16 @@ class MqttLink(private val cfg: Config, private val listener: Listener) {
 
     enum class State { CONNECTING, CONNECTED, RETRY }
 
+    /** Why the last attempt failed; the service turns it into a localised text. */
+    enum class Reason { AUTH, UNREACHABLE, NO_ANSWER, REJECTED, LOST, OTHER }
+
+    data class Problem(val reason: Reason, val detail: String = "")
+
     interface Listener {
         /** Connected and subscribed: publish discovery, availability and current states now. */
         fun onReady()
         fun onMessage(topic: String, payload: String)
-        fun onState(state: State, detail: String)
+        fun onState(state: State, problem: Problem?)
     }
 
     private val ctl: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor { r ->
@@ -152,14 +157,17 @@ class MqttLink(private val cfg: Config, private val listener: Listener) {
             connectionTimeout = 10
             isAutomaticReconnect = false
             maxInflight = 64
-            if (cfg.user.isNotEmpty()) userName = cfg.user
-            if (cfg.pass.isNotEmpty()) password = cfg.pass.toCharArray()
+            // MQTT 3.1.1 allows a password only together with a user name.
+            if (cfg.user.isNotEmpty()) {
+                userName = cfg.user
+                if (cfg.pass.isNotEmpty()) password = cfg.pass.toCharArray()
+            }
             setWill(cfg.topics.avail, OFFLINE, 1, true)
             if (cfg.tls) socketFactory = SSLSocketFactory.getDefault()
         }
         connecting = true
         ready = false
-        listener.onState(State.CONNECTING, "")
+        listener.onState(State.CONNECTING, null)
         try {
             c.connect(options, null, object : IMqttActionListener {
                 override fun onSuccess(token: IMqttToken?) = post {
@@ -174,7 +182,7 @@ class MqttLink(private val cfg: Config, private val listener: Listener) {
                     restart(c, describe(e))
                 }
             })
-            armDeadline(c, CONNECT_DEADLINE_SEC, "broker did not answer the connection") { connecting }
+            armDeadline(c, CONNECT_DEADLINE_SEC, Problem(Reason.NO_ANSWER, "CONNACK")) { connecting }
         } catch (e: Exception) {
             connecting = false
             restart(c, describe(e))
@@ -187,30 +195,36 @@ class MqttLink(private val cfg: Config, private val listener: Listener) {
             c.subscribe(subscriptions, IntArray(subscriptions.size) { 1 }, null, object : IMqttActionListener {
                 override fun onSuccess(token: IMqttToken?) = post {
                     if (stopped || client !== c || ready) return@post
-                    if (token?.grantedQos?.any { it == 0x80 } == true) {
-                        restart(c, "subscription rejected by broker")
+                    // 0x80 = refused by the broker ACL. Fatal only for the command topics;
+                    // homeassistant/status is a nice-to-have.
+                    val granted = token?.grantedQos
+                    if (granted != null && granted.take(COMMAND_TOPICS).any { it == 0x80 }) {
+                        restart(c, Problem(Reason.REJECTED))
                         return@post
+                    }
+                    if (granted != null && granted.drop(COMMAND_TOPICS).any { it == 0x80 }) {
+                        Log.w(TAG, "broker refused ${Topics.HA_STATUS}; Home Assistant restarts will not trigger a re-announce")
                     }
                     ready = true
                     deadline?.cancel(false)
                     deadline = null
                     backoffSec = 1
-                    listener.onState(State.CONNECTED, "")
+                    listener.onState(State.CONNECTED, null)
                     listener.onReady()
                 }
 
                 override fun onFailure(token: IMqttToken?, e: Throwable?) = post {
-                    if (client === c) restart(c, "subscribe: " + describe(e))
+                    if (client === c) restart(c, describe(e))
                 }
             })
-            armDeadline(c, SUBSCRIBE_DEADLINE_SEC, "broker did not confirm the subscription") { !ready }
+            armDeadline(c, SUBSCRIBE_DEADLINE_SEC, Problem(Reason.NO_ANSWER, "SUBACK")) { !ready }
         } catch (e: Exception) {
-            restart(c, "subscribe: " + describe(e))
+            restart(c, describe(e))
         }
     }
 
     /** If [stillWaiting] is true after [seconds], this attempt is dead: drop the client and retry. */
-    private fun armDeadline(c: MqttAsyncClient, seconds: Long, reason: String, stillWaiting: () -> Boolean) {
+    private fun armDeadline(c: MqttAsyncClient, seconds: Long, reason: Problem, stillWaiting: () -> Boolean) {
         deadline?.cancel(false)
         deadline = try {
             ctl.schedule(Runnable {
@@ -238,7 +252,7 @@ class MqttLink(private val cfg: Config, private val listener: Listener) {
     }
 
     /** Drops the client completely (fresh threads and state next time) and schedules a retry. */
-    private fun restart(c: MqttAsyncClient, reason: String) {
+    private fun restart(c: MqttAsyncClient, reason: Problem) {
         if (client === c) client = null
         connecting = false
         ready = false
@@ -248,9 +262,9 @@ class MqttLink(private val cfg: Config, private val listener: Listener) {
         scheduleRetry(reason)
     }
 
-    private fun scheduleRetry(reason: String) {
+    private fun scheduleRetry(reason: Problem) {
         if (stopped) return
-        Log.i(TAG, "retry in ~${backoffSec}s: $reason")
+        Log.i(TAG, "retry in ~${backoffSec}s: ${reason.reason} ${reason.detail}")
         listener.onState(State.RETRY, reason)
         retry?.cancel(false)
         // Up to +25 % jitter so several panels do not hammer a restarting broker in lockstep.
@@ -308,17 +322,20 @@ class MqttLink(private val cfg: Config, private val listener: Listener) {
         private const val CONNECT_DEADLINE_SEC = 25L
         private const val SUBSCRIBE_DEADLINE_SEC = 20L
         private const val MAX_BACKOFF_SEC = 30L
+        private const val COMMAND_TOPICS = 3
         private val OFFLINE = "offline".toByteArray()
 
-        fun describe(e: Throwable?): String = when (e) {
-            null -> "connection lost"
+        fun describe(e: Throwable?): Problem = when (e) {
+            null -> Problem(Reason.LOST)
             is MqttException -> when (e.reasonCode) {
                 MqttException.REASON_CODE_FAILED_AUTHENTICATION.toInt(),
-                MqttException.REASON_CODE_NOT_AUTHORIZED.toInt() -> "wrong login or password"
-                MqttException.REASON_CODE_SERVER_CONNECT_ERROR.toInt() -> e.cause?.message ?: "broker unreachable"
-                else -> e.cause?.message ?: e.message ?: "MQTT error ${e.reasonCode}"
+                MqttException.REASON_CODE_NOT_AUTHORIZED.toInt() -> Problem(Reason.AUTH)
+                MqttException.REASON_CODE_SERVER_CONNECT_ERROR.toInt() -> Problem(Reason.UNREACHABLE, e.cause?.message.orEmpty())
+                MqttException.REASON_CODE_CLIENT_TIMEOUT.toInt() -> Problem(Reason.NO_ANSWER)
+                MqttException.REASON_CODE_CONNECTION_LOST.toInt() -> Problem(Reason.LOST, e.cause?.message.orEmpty())
+                else -> Problem(Reason.OTHER, e.cause?.message ?: e.message ?: "MQTT ${e.reasonCode}")
             }
-            else -> e.message ?: e.javaClass.simpleName
+            else -> Problem(Reason.OTHER, e.message ?: e.javaClass.simpleName)
         }
     }
 }

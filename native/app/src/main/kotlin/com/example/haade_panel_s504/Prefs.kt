@@ -41,10 +41,13 @@ class Prefs(context: Context) {
         get() = sp.getString("cleanup_node_id", "").orEmpty()
         set(v) { sp.edit().putString("cleanup_node_id", v).apply() }
 
-    var deviceName: String
-        get() = sp.getString("device_name", null)?.takeIf { it.isNotBlank() }
-            ?: appContext.getString(R.string.device_name_default)
-        set(v) { sp.edit().putString("device_name", v).apply() }
+    /** Empty = the localised default ("Wall Panel" / "Настенная панель" / "Panneau mural"). */
+    var deviceNameRaw: String
+        get() = sp.getString("device_name", "").orEmpty()
+        set(v) { sp.edit().putString("device_name", v.trim()).apply() }
+
+    val deviceName: String
+        get() = deviceNameRaw.ifBlank { appContext.getString(R.string.device_name_default) }
 
     // ---- features
     var thsEnabled: Boolean
@@ -101,9 +104,4 @@ class Prefs(context: Context) {
             .apply()
     }
 
-    fun relay(n: Int): Boolean = sp.getBoolean("relay_$n", false)
-
-    fun saveRelay(n: Int, on: Boolean) {
-        sp.edit().putBoolean("relay_$n", on).apply()
-    }
 }

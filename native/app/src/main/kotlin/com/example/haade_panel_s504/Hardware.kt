@@ -22,11 +22,22 @@ object Hardware {
     /** r, g, b in 0..255; the driver takes 16 steps per channel. */
     fun setLed(r: Int, g: Int, b: Int): Boolean {
         if (ledBroken) return false
+        var lr = level(r)
+        var lg = level(g)
+        var lb = level(b)
+        if (lr == 0 && lg == 0 && lb == 0 && (r > 0 || g > 0 || b > 0)) {
+            // Very dim but switched on: light the strongest channel at the lowest step instead of going dark.
+            when (maxOf(r, g, b)) {
+                r -> lr = 1
+                g -> lg = 1
+                else -> lb = 1
+            }
+        }
         return try {
             jnielc.seekstart()
-            jnielc.ledseek(0xa1, level(r))
-            jnielc.ledseek(0xa2, level(g))
-            jnielc.ledseek(0xa3, level(b))
+            jnielc.ledseek(0xa1, lr)
+            jnielc.ledseek(0xa2, lg)
+            jnielc.ledseek(0xa3, lb)
             jnielc.seekstop()
             ledError = null
             true

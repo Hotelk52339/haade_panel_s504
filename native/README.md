@@ -26,6 +26,9 @@ unique_ids are the same, so existing Home Assistant entities and automations kee
 The status card shows the connection, temperature, humidity, backlight colour and relays.
 Everything keeps running after the screen is closed.
 
+Relays always start switched off after a restart of the panel or the service (safe for pulse loads);
+the backlight comes back with its last colour.
+
 ## Several panels
 
 Give every panel its own **MQTT ID** (for example `panel_kitchen`). Each ID has its own topics,
