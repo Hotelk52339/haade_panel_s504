@@ -24,7 +24,7 @@ import kotlin.random.Random
  *
  * The original app's client never dropped a connection whose keep-alive pings went unanswered, so
  * after a network or broker hiccup it could stay "connected" to nothing. Here:
- * - Paho's keep-alive drops a dead link after 1.5 × 30 s;
+ * - keep-alive (30 s) drops a dead link within about a minute;
  * - every failure path schedules the next attempt (1, 2, 4 … 30 s plus jitter);
  * - connect and subscribe have deadlines (Paho's connectionTimeout covers only the TCP handshake,
  *   a broker that accepts the socket but never sends CONNACK would otherwise hang it forever);
